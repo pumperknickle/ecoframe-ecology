@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ecoframe-ecology"
+version = "0.1.0"
+description = "Brain registry and multi-brain population coordination for ecoframe"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "ecoframe>=0.1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Future backends — zero code changes when swapping
+redis  = ["redis>=5.0"]          # shared registry across machines
+nats   = ["nats-py>=2.3"]        # pub/sub brain registry
+saas   = ["httpx>=0.25"]         # REST API backend (SaaS registry service)
+dev    = ["pytest>=7.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ecoframe_ecology"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
