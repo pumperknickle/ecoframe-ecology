@@ -22,21 +22,26 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ecoframe.field import Field
-from ecoframe.signal import BrainSignal, EnvironmentSignal
+from ecoframe.signal import BrainSignal, CertSignal, EnvironmentSignal
 
 
 @dataclass
 class BrainEntry:
     """State snapshot for one registered brain."""
-    brain_id:     str
-    ce_ema:       float = 5.5
-    ce_prev:      float = 5.5    # for plateau detection
-    surprise:     float = 0.0
-    steps:        int   = 0
-    env_id:       str   = ""
-    scale:        str   = ""
-    load:         float = 1.0
-    plateau_steps: int  = 0      # steps since ce_ema last improved
+    brain_id:      str
+    ce_ema:        float = 5.5
+    ce_prev:       float = 5.5
+    surprise:      float = 0.0
+    steps:         int   = 0
+    env_id:        str   = ""
+    scale:         str   = ""
+    load:          float = 1.0
+    plateau_steps: int   = 0
+
+    # Certification state
+    certifications:   list = field(default_factory=list)  # earned cert names
+    cert_attempts:    dict = field(default_factory=dict)  # cert_name → step when last attempted
+    cert_retry_after: dict = field(default_factory=dict)  # cert_name → steps required before retry
 
 
 class BrainRegistry:
@@ -130,34 +135,83 @@ class BrainRegistry:
 
     # ── Routing ───────────────────────────────────────────────────────────────
 
+    def record_cert(self, brain_id: str, cert_signal: 'CertSignal') -> None:
+        """
+        Called when a CertSignal arrives in the Field for this brain.
+        Updates certifications and records the attempt (for rate limiting).
+        """
+        entry = self._backend.get(brain_id)
+        if entry is None:
+            return
+        # Record attempt + retry_after from the signal (for rate limiting)
+        entry.cert_attempts[cert_signal.cert_name]    = entry.steps
+        entry.cert_retry_after[cert_signal.cert_name] = cert_signal.retry_after_steps
+        if cert_signal.passed >= 0.5:
+            if cert_signal.cert_name not in entry.certifications:
+                entry.certifications.append(cert_signal.cert_name)
+                if self._verbose:
+                    print(f"BrainRegistry: {brain_id} earned cert "
+                          f"'{cert_signal.cert_name}' "
+                          f"(score={cert_signal.score:.2f})", flush=True)
+        else:
+            if self._verbose:
+                print(f"BrainRegistry: {brain_id} failed cert "
+                      f"'{cert_signal.cert_name}' — retry after "
+                      f"{cert_signal.retry_after_steps} steps", flush=True)
+        self._backend.upsert(entry)
+
     def _recommend_env(self, brain_id: str, current_env_id: str) -> 'str | None':
         """
         Recommend the highest expected-learning environment for this brain.
 
-        expected_learning = env.curiosity × (1 - env.load_fraction)
+        Filters out environments that:
+          1. Are the brain's current env
+          2. Require certs the brain hasn't earned
+          3. Are cert envs the brain attempted too recently (rate limited)
 
-        Only recommends envs different from current and with higher
-        expected learning than the brain's current ce_ema.
+        expected_learning = curiosity × (1 - load_fraction)
         """
-        env_sigs = [
-            s for s in self._field.query(pos=(0.0, 0.0), radius=100.0)
-            if isinstance(s, EnvironmentSignal) and s.publisher != current_env_id
-        ]
+        entry = self._backend.get(brain_id)
+        if entry is None:
+            return None
+
+        env_sigs = []
+        for s in self._field.query(pos=(0.0, 0.0), radius=100.0):
+            if not isinstance(s, EnvironmentSignal):
+                continue
+            if s.publisher == current_env_id:
+                continue
+
+            # Check prerequisite certs
+            if s.required_certs:
+                required = [c for c in s.required_certs.split(',') if c]
+                if not all(c in entry.certifications for c in required):
+                    continue   # brain hasn't earned required certs
+
+            # Check cert rate limit (applies to cert envs = those that issue certs)
+            # A cert env's publisher ID appears in cert_attempts after an attempt
+            last_attempt = entry.cert_attempts.get(s.publisher, -1)
+            if last_attempt >= 0:
+                retry_after = entry.cert_retry_after.get(s.publisher, 5000)
+                if (entry.steps - last_attempt) < retry_after:
+                    continue   # rate limited: hasn't earned enough steps since last attempt
+
+            env_sigs.append(s)
+
         if not env_sigs:
             return None
 
-        best = max(
-            env_sigs,
-            key=lambda s: s.curiosity * (1.0 - min(s.load_fraction, 0.95)),
-        )
-        entry = self._backend.get(brain_id)
-        if best.curiosity <= (entry.ce_ema if entry else 0):
+        best = max(env_sigs,
+                   key=lambda s: s.curiosity * (1.0 - min(s.load_fraction, 0.95)))
+
+        if best.curiosity <= entry.ce_ema:
             return None  # current env still has more to teach
 
         if self._verbose:
             print(f"BrainRegistry: {brain_id} plateau={entry.plateau_steps} "
                   f"→ recommending '{best.publisher}' "
-                  f"(curiosity={best.curiosity:.2f})", flush=True)
+                  f"(curiosity={best.curiosity:.2f} "
+                  f"certs={entry.certifications})", flush=True)
         return best.publisher
 
     # ── Population views ──────────────────────────────────────────────────────
@@ -181,15 +235,16 @@ class BrainRegistry:
 
     def _publish(self, entry: BrainEntry) -> None:
         sig = BrainSignal(
-            position  = (0.0, 0.0),
-            timestamp = self._step,
-            publisher = entry.brain_id,
-            ce_ema    = entry.ce_ema,
-            surprise  = entry.surprise,
-            steps     = float(entry.steps),
-            load      = entry.load,
-            env_id    = entry.env_id,
-            scale     = entry.scale,
+            position       = (0.0, 0.0),
+            timestamp      = self._step,
+            publisher      = entry.brain_id,
+            ce_ema         = entry.ce_ema,
+            surprise       = entry.surprise,
+            steps          = float(entry.steps),
+            load           = entry.load,
+            env_id         = entry.env_id,
+            scale          = entry.scale,
+            certifications = ','.join(entry.certifications),
         )
         self._field.publish(entry.brain_id, sig)
 
